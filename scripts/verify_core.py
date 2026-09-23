@@ -45,9 +45,16 @@ def main() -> int:
 
     # --- Case 1: WDRR selection order -------------------------------------
     def submit(tid, gpus, mins, weight, when):
+        prior = db.get_conn().execute(
+            "SELECT aging_settled_at AS ts FROM tenants WHERE id = ?", (tid,)
+        ).fetchone()
         job = scheduler.submit_job(tid, gpus, mins, weight)
         db.get_conn().execute(
             "UPDATE jobs SET queued_at = ? WHERE id = ?", (when, job["id"]))
+        if prior is None or prior["ts"] is None:
+            db.get_conn().execute(
+                "UPDATE tenants SET aging_settled_at = ? WHERE id = ?",
+                (when, tid))
         return job
 
     submit("a", 1, 30, 1.0, iso(0))

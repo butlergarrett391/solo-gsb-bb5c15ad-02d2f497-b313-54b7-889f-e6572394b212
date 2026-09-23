@@ -56,6 +56,15 @@ class JobIn(BaseModel):
         default=1.0, gt=0,
         description="Tenant weight; auto-registers the tenant or updates it.",
     )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Prerequisite job ids (any tenant). The job is dispatched only "
+            "after every prerequisite is COMPLETED. Unknown ids and cycles "
+            "are rejected."
+        ),
+        examples=[["J000001"]],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -93,12 +102,16 @@ def scheduler_state():
 
 @app.post("/jobs", tags=["jobs"], status_code=201)
 def submit_job(body: JobIn):
-    return scheduler.submit_job(
-        tenant_id=body.tenant_id,
-        gpus=body.gpus,
-        duration_min=body.duration_min,
-        weight=body.weight,
-    )
+    try:
+        return scheduler.submit_job(
+            tenant_id=body.tenant_id,
+            gpus=body.gpus,
+            duration_min=body.duration_min,
+            weight=body.weight,
+            depends_on=body.depends_on,
+        )
+    except SchedulerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
 
 
 @app.get("/jobs", tags=["jobs"])
@@ -146,7 +159,8 @@ def complete_job(job_id: str):
 
 @app.get("/queue", tags=["scheduler"])
 def get_queue():
-    """FIFO per-tenant queues, positions, weights and balances."""
+    """FIFO per-tenant queues with positions, weights, balances and
+    dependency blocking (head_blocked_by / per-job blocked_by)."""
     return scheduler.queue_overview()
 
 

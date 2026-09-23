@@ -1,11 +1,13 @@
 # GPU Fair-Queuing Scheduler (FastAPI + SQLite)
 
-多租户 GPU 作业**加权 Deficit Round-Robin（WDRR）公平排队 API**，内置**等待时间老化补偿**防止小作业长期饥饿，并在任何时刻**不越过集群 GPU 容量约束**。
+多租户 GPU 作业**加权 Deficit Round-Robin（WDRR）公平排队 API**，内置**等待时间老化补偿**防止小作业长期饥饿，并在任何时刻**不越过集群 GPU 容量约束**。支持**作业依赖（`depends_on`，可跨租户）**：前置作业全部 `COMPLETED` 后依赖作业才参与调度。
 
 - **语言/框架**：Python 3.11 + FastAPI + Uvicorn
+- **监听端口**：容器内 `8000`，宿主机映射 `http://localhost:8000`（可在 `docker-compose.yml` 的 `ports` 修改）
 - **存储**：SQLite（WAL 模式，零外部依赖，数据持久化到挂载卷）
 - **可复现**：固定租户访问顺序（租户 id 升序）、租户内 FIFO、顺序作业 id、无随机数；相同输入必然得到相同选择顺序
 - **可审计**：每笔 `AGING / QUANTUM / DISPATCH` 余额变动都写入 `ledger`
+- **依赖 DAG**：提交时校验前置作业存在性与环路；依赖未满足的队首作业**不消耗量子、不占用 GPU、不计老化**
 
 ---
 
@@ -69,6 +71,19 @@ cost_gpu_min = gpus × duration_min        # GPU-分钟
 - 队列排空后老化时钟重置，新作业从自己的到达时刻重新计时。
 - 同一时刻重复调度不会产生信用（不可刷）。
 
+### 作业依赖（`depends_on`）
+
+提交作业时可给出前置作业 id 列表（**允许跨租户**）：
+
+- 前置作业**必须已存在**，否则 `400 unknown depends_on job id(s)`；重复 id 自动去重。
+- 增加依赖边不得形成**环路**，否则 `400 ... dependency cycle ...`（作业 id 单调递增，正常 API
+  顺序提交天然无环；该校验同时防御图中已存在的环）。
+- 只有当**所有**前置作业均为 `COMPLETED` 时，依赖作业才成为“可调度队首”。
+- 依赖未满足的队首作业：**不获得 QUANTUM、不占用 GPU、不累积老化补偿**；租户队列严格
+  FIFO，其后的独立作业也不能越过它。
+- 前置作业被 **CANCELLED** 时永远无法完成，依赖作业**保持阻塞**，`blocked_by` 会给出
+  `prerequisite ... was CANCELLED ...` 原因；需自行 `cancel` 该依赖作业放弃等待。
+
 ### 生命周期
 
 ```
@@ -102,12 +117,17 @@ RUNNING 作业占用 GPU，直到 `complete`/`cancel` 才释放给后续批次�
 ### 1. 提交作业 `POST /jobs`
 
 提交作业时租户会被自动注册（也可用 `POST /tenants` 单独管理权重）。
-同一租户重复提交可更新其权重。
+同一租户重复提交可更新其权重。可用 `depends_on` 声明前置作业（可跨租户，详见上文「作业依赖」）。
 
 ```bash
 curl -X POST http://localhost:8000/jobs \
   -H 'Content-Type: application/json' \
   -d '{"tenant_id":"team-a","gpus":2,"duration_min":30,"weight":1}'
+
+# 依赖 J000001（任何租户）完成后才可调度
+curl -X POST http://localhost:8000/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"team-b","gpus":2,"duration_min":30,"depends_on":["J000001"]}'
 ```
 
 | 字段 | 必填 | 说明 |
@@ -116,8 +136,13 @@ curl -X POST http://localhost:8000/jobs \
 | `gpus` | 是 | 所需 GPU 数（正整数） |
 | `duration_min` | 是 | 预计时长（分钟，正整数） |
 | `weight` | 否 | 租户权重，默认 `1.0`，必须 > 0 |
+| `depends_on` | 否 | 前置作业 id 的字符串数组（可跨租户），默认 `[]`；不存在的 id 或环路返回 400 |
 
-响应：作业对象（顺序 id 如 `J000001`，`status: QUEUED`）。
+响应：作业对象（顺序 id 如 `J000001`，`status: QUEUED`），并带：
+
+- `depends_on`：声明的前置作业 id 列表；
+- `blocked_by`：当前仍未 `COMPLETED` 的前置作业数组（每项含 `job_id`、`status`、可读
+  `reason`，含前置被取消的说明）；无阻塞时为 `[]`。非 QUEUED 作业该字段恒为 `[]`。
 
 ### 2. 调度下一批 `POST /scheduler/batch`
 
@@ -163,34 +188,45 @@ curl -X POST http://localhost:8000/jobs/J000002/cancel     # QUEUED/RUNNING -> C
 ### 4. 查询队列 / 作业 / 租户 / 流水
 
 ```bash
-curl http://localhost:8000/queue                    # 每租户 FIFO 队列、位置、权重、余额
+curl http://localhost:8000/queue                    # 每租户 FIFO 队列、位置、权重、余额、阻塞原因
 curl "http://localhost:8000/jobs?status=QUEUED"     # 可按 status / tenant_id 过滤
-curl http://localhost:8000/jobs/J000001
+curl http://localhost:8000/jobs/J000001             # 作业详情含 depends_on / blocked_by
 curl http://localhost:8000/tenants                  # 全部租户 + 余额
 curl http://localhost:8000/tenants/team-a
 curl http://localhost:8000/scheduler/state          # 容量、空闲 GPU、调参、租户余额
 curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/DISPATCH 审计
 ```
 
-`GET /queue` 示例：
+`GET /queue` 示例（队首作业被 `J000001` 阻塞）：
 
 ```jsonc
 {
-  "cluster_gpus": 8, "used_gpus": 6, "free_gpus": 2,
+  "cluster_gpus": 8, "used_gpus": 1, "free_gpus": 7,
   "queued_jobs": 1, "running_jobs": 1,
   "queues": [{
-    "tenant_id": "team-c", "weight": 1.0, "balance_gpu_min": 12.5,
-    "oldest_queued_at": "2026-09-22T10:00:00+00:00",
-    "jobs": [ { "id": "J000003", "position": 1, "gpus": 4, ... } ]
+    "tenant_id": "team-b", "weight": 1.0, "balance_gpu_min": 0.0,
+    "oldest_queued_at": "2026-09-23T10:00:00+00:00",
+    "head_blocked_by": [
+      {"job_id": "J000001", "status": "RUNNING",
+       "reason": "prerequisite J000001 is RUNNING, not COMPLETED"}
+    ],
+    "jobs": [ { "id": "J000002", "position": 1,
+                "depends_on": ["J000001"],
+                "blocked_by": [ { "job_id": "J000001", "status": "RUNNING",
+                                  "reason": "..." } ],
+                "gpus": 2, ... } ]
   }]
 }
 ```
+
+前置作业 `CANCELLED` 时 `reason` 形如
+`prerequisite J000001 was CANCELLED and can never complete`，据此可查询永久阻塞原因。
 
 ### 端点一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/jobs` | 提交作业（自动注册/更新租户权重） |
+| POST | `/jobs` | 提交作业（自动注册/更新租户权重；支持 `depends_on` 依赖，拒绝不存在依赖与环路） |
 | GET | `/jobs` | 列作业（可选 `status`、`tenant_id`） |
 | GET | `/jobs/{id}` | 作业详情 |
 | POST | `/jobs/{id}/cancel` | 取消作业 |
@@ -225,6 +261,21 @@ curl -s -X POST localhost:8000/scheduler/batch        # => [J000003]，carol 获
 curl -s localhost:8000/queue
 ```
 
+作业依赖端到端（跨租户，前置取消则永久阻塞）：
+
+```bash
+# up 租户的 J000004 先跑；down 租户的 J000005 依赖它
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"up","gpus":1,"duration_min":10}'
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"down","gpus":1,"duration_min":10,"depends_on":["J000004"]}'
+
+curl -s -X POST localhost:8000/scheduler/batch        # => ["J000004"]（J000005 阻塞，不耗量子）
+curl -s localhost:8000/jobs/J000005                   # blocked_by: 前置 RUNNING
+curl -s -X POST localhost:8000/jobs/J000004/complete
+curl -s -X POST localhost:8000/scheduler/batch        # => ["J000005"]，依赖释放后才调度
+```
+
 ---
 
 ## 本地开发（不使用 Docker）
@@ -233,7 +284,7 @@ curl -s localhost:8000/queue
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（12 个：服务层算法 + HTTP 端到端）
+# 运行全部测试（32 个：服务层算法/依赖 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
 # 无需第三方库的核心算法验证脚本（仅用标准库 sqlite3）
@@ -248,14 +299,16 @@ CLUSTER_GPUS=8 .venv/bin/python -m uvicorn app.main:app --reload --port 8000
 ```
 app/
   config.py       # 环境变量配置
-  db.py           # SQLite 连接、schema（tenants/jobs/batches/ledger）
-  scheduler.py    # 公平排队核心（WDRR + 老化，框架无关）
+  db.py           # SQLite 连接、schema（tenants/jobs/job_dependencies/batches/ledger）
+  scheduler.py    # 公平排队核心（WDRR + 老化 + 依赖 DAG，框架无关）
   main.py         # FastAPI 路由与请求模型
 scripts/
   verify_core.py  # 零依赖核心算法验证
 tests/
-  test_scheduler.py  # 算法测试（注入时间，确定性断言）
-  test_api.py        # HTTP 端到端测试
+  test_scheduler.py       # 算法测试（注入时间，确定性断言）
+  test_dependencies.py    # 依赖：校验/阻塞/释放/取消/跨租户（服务层）
+  test_api.py             # HTTP 端到端测试
+  test_dependencies_api.py # 依赖的 HTTP 端到端测试
 Dockerfile
 docker-compose.yml
 ```

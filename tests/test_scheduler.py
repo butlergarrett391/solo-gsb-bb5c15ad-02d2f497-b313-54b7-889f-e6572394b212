@@ -5,13 +5,29 @@ from app import db, scheduler
 from tests.conftest import at, iso  # noqa: F401
 
 
-def submit(tenant, gpus, minutes, weight=1.0, when=None):
-    job = scheduler.submit_job(tenant, gpus, minutes, weight)
+def submit(tenant, gpus, minutes, weight=1.0, when=None, depends_on=None):
+    conn = db.get_conn()
+    prior = conn.execute(
+        "SELECT aging_settled_at AS ts FROM tenants WHERE id = ?",
+        (tenant,),
+    ).fetchone()
+    job = scheduler.submit_job(
+        tenant, gpus, minutes, weight, depends_on=depends_on
+    )
     if when is not None:
-        db.get_conn().execute(
+        # Backdate arrival times to simulate jobs submitted in the past.
+        conn.execute(
             "UPDATE jobs SET queued_at = ? WHERE id = ?", (when, job["id"])
         )
-    return scheduler._get_job_or_404(db.get_conn(), job["id"])
+        # New tenant, or a tenant whose queue had drained (NULL window):
+        # its aging clock opens at the job's (backdated) arrival. A tenant
+        # already waiting keeps its earlier settlement instant.
+        if prior is None or prior["ts"] is None:
+            conn.execute(
+                "UPDATE tenants SET aging_settled_at = ? WHERE id = ?",
+                (when, tenant),
+            )
+    return scheduler._get_job_or_404(conn, job["id"])
 
 
 def batch(now_minutes):

@@ -85,6 +85,23 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status
             ON jobs(tenant_id, status);
 
+        -- Job dependency edges (DAG by submission-time validation): a job may
+        -- only be dispatched after every prerequisite is COMPLETED. Edges are
+        -- tenant-agnostic, so cross-tenant dependencies are supported. A
+        -- CANCELLED prerequisite never completes, so dependents stay blocked
+        -- forever (reported via blocked_by) until cancelled themselves.
+        CREATE TABLE IF NOT EXISTS job_dependencies (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id       TEXT NOT NULL REFERENCES jobs(id),
+            depends_on   TEXT NOT NULL REFERENCES jobs(id),
+            created_at   TEXT NOT NULL,
+            UNIQUE(job_id, depends_on)
+        );
+        CREATE INDEX IF NOT EXISTS idx_deps_job
+            ON job_dependencies(job_id);
+        CREATE INDEX IF NOT EXISTS idx_deps_prereq
+            ON job_dependencies(depends_on);
+
         CREATE TABLE IF NOT EXISTS batches (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at       TEXT NOT NULL,
