@@ -165,6 +165,45 @@ def main() -> int:
     assert q["running_jobs"] == 1 and q["queued_jobs"] == 0
     print("case 6 cancel/queue state OK")
 
+    # --- Case 7: job dependencies (cross-tenant, blocking, release) --------
+    db.reset_for_tests()
+    db.connect(":memory:")
+    pre = submit("a", 1, 10, 1.0, iso(0))
+    dep = scheduler.submit_job("b", 1, 10, 1.0, depends_on=[pre["id"]])
+    db.get_conn().execute(
+        "UPDATE jobs SET queued_at = ? WHERE id = ?", (iso(1), dep["id"]))
+    dep = scheduler._get_job_or_404(db.get_conn(), dep["id"])
+    assert dep["depends_on"] == ["J000001"]
+    assert dep["blocked_by"] == [{"id": "J000001", "status": "QUEUED"}]
+
+    # Unknown prerequisite rejected.
+    try:
+        scheduler.submit_job("c", 1, 10, depends_on=["J000999"])
+    except scheduler.SchedulerError as e:
+        assert "unknown depends_on" in str(e)
+    else:
+        raise AssertionError("unknown dependency should be rejected")
+
+    r = scheduler.run_batch(now=at(10))
+    assert r["selection_order"] == ["J000001"], r["selection_order"]
+    # Blocked tenant earns nothing (no aging, no quantum).
+    assert scheduler.get_tenant("b")["balance_gpu_min"] == 0.0
+    assert all(e["tenant_id"] != "b" for e in r["events"])
+    assert scheduler.run_batch(now=at(20))["selection_order"] == []
+
+    scheduler.complete_job("J000001")
+    r2 = scheduler.run_batch(now=at(30))
+    assert r2["selection_order"] == ["J000002"], r2["selection_order"]
+
+    # Cancelled prerequisite blocks forever, with a queryable reason.
+    p3 = scheduler.submit_job("a", 1, 10)
+    d3 = scheduler.submit_job("b", 1, 10, depends_on=[p3["id"]])
+    scheduler.cancel_job(p3["id"])
+    assert scheduler.run_batch(now=at(40))["selection_order"] == []
+    assert scheduler.get_job(d3["id"])["blocked_by"] == [
+        {"id": p3["id"], "status": "CANCELLED"}]
+    print("case 7 dependencies + blocked_by OK")
+
     print("\nALL CORE CHECKS PASSED")
     return 0
 

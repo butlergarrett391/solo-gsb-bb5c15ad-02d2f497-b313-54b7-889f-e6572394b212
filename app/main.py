@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import db, scheduler
 from .config import get_settings
@@ -56,6 +56,22 @@ class JobIn(BaseModel):
         default=1.0, gt=0,
         description="Tenant weight; auto-registers the tenant or updates it.",
     )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Job ids that must reach COMPLETED before this job is schedulable. "
+            "Dependencies are cluster-global (cross-tenant allowed); unknown "
+            "ids and dependency cycles are rejected."
+        ),
+        examples=[["J000001"]],
+    )
+
+    @field_validator("depends_on")
+    @classmethod
+    def _non_empty_dependency_ids(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(d, str) or not d.strip() for d in value):
+            raise ValueError("depends_on entries must be non-empty strings")
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +114,7 @@ def submit_job(body: JobIn):
         gpus=body.gpus,
         duration_min=body.duration_min,
         weight=body.weight,
+        depends_on=body.depends_on,
     )
 
 

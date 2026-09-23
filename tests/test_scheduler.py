@@ -5,8 +5,10 @@ from app import db, scheduler
 from tests.conftest import at, iso  # noqa: F401
 
 
-def submit(tenant, gpus, minutes, weight=1.0, when=None):
-    job = scheduler.submit_job(tenant, gpus, minutes, weight)
+def submit(tenant, gpus, minutes, weight=1.0, when=None, depends_on=None):
+    job = scheduler.submit_job(
+        tenant, gpus, minutes, weight, depends_on=depends_on
+    )
     if when is not None:
         db.get_conn().execute(
             "UPDATE jobs SET queued_at = ? WHERE id = ?", (when, job["id"])
@@ -215,3 +217,160 @@ def test_reproducible_selection(conn):
         got = [j["id"] for j in r["selected_jobs"] if j["tenant_id"] == tid]
         assert got == jobs
     assert len(r["selection_order"]) == 6
+
+
+# ---------------------------------------------------------------------------
+# Job dependencies
+# ---------------------------------------------------------------------------
+
+def test_dependency_blocks_head_and_consumes_nothing(conn):
+    # Cross-tenant: b's job waits on a's job.
+    a1 = submit("a", 1, 10, weight=1.0, when=iso(0))
+    b1 = submit("b", 1, 10, weight=1.0, when=iso(1), depends_on=[a1["id"]])
+
+    # The dependent reports its blocker (id + current status).
+    assert b1["depends_on"] == ["J000001"]
+    assert b1["blocked_by"] == [{"id": "J000001", "status": "QUEUED"}]
+
+    r = batch(10)
+    # Only the prerequisite runs; b's head is dependency-blocked.
+    assert r["selection_order"] == ["J000001"]
+    # No QUANTUM and no AGING landed for b while its head was blocked.
+    b_events = [e for e in r["events"] if e["tenant_id"] == "b"]
+    assert b_events == []
+    assert balances()["b"] == 0.0
+
+    # Still blocked while the prerequisite is RUNNING.
+    r2 = batch(20)
+    assert r2["selection_order"] == []
+    assert balances()["b"] == 0.0
+
+    # Completion releases the dependent; next batch dispatches it.
+    scheduler.complete_job("J000001")
+    r3 = batch(30)
+    assert r3["selection_order"] == ["J000002"]
+    released = scheduler.get_job("J000002")
+    assert released["status"] == "RUNNING"
+    assert released["blocked_by"] == []
+
+
+def test_all_prerequisites_must_complete(conn):
+    p1 = submit("a", 1, 5, when=iso(0))
+    p2 = submit("a", 1, 5, when=iso(0))
+    dep = submit("b", 1, 5, when=iso(0), depends_on=[p2["id"], p1["id"]])
+    # Deduplicated and ordered on output.
+    assert dep["depends_on"] == ["J000001", "J000002"]
+
+    r = batch(10)
+    assert r["selection_order"] == ["J000001", "J000002"]
+
+    scheduler.complete_job("J000001")
+    r2 = batch(20)
+    assert r2["selection_order"] == []  # J000002 still RUNNING
+    detail = scheduler.get_job(dep["id"])
+    assert detail["blocked_by"] == [{"id": "J000002", "status": "RUNNING"}]
+
+    scheduler.complete_job("J000002")
+    r3 = batch(30)
+    assert r3["selection_order"] == ["J000003"]
+
+
+def test_cancelled_prerequisite_keeps_dependent_blocked(conn):
+    p = submit("a", 1, 5, when=iso(0))
+    dep = submit("b", 1, 5, when=iso(0), depends_on=[p["id"]])
+
+    scheduler.cancel_job(p["id"])  # prerequisite cancelled while queued
+    detail = scheduler.get_job(dep["id"])
+    assert detail["status"] == "QUEUED"
+    assert detail["blocked_by"] == [{"id": "J000001", "status": "CANCELLED"}]
+
+    r = batch(10)
+    assert r["selection_order"] == []
+    # No credit of any kind while blocked by a cancelled prerequisite.
+    assert all(e["tenant_id"] != "b" for e in r["events"])
+    assert balances()["b"] == 0.0
+
+    # And it remains blocked forever on later batches.
+    r2 = batch(100)
+    assert r2["selection_order"] == []
+    assert scheduler.get_job(dep["id"])["blocked_by"] == [
+        {"id": "J000001", "status": "CANCELLED"}
+    ]
+
+    # /queue marks the same reason.
+    q = scheduler.queue_overview()
+    job = q["queues"][0]["jobs"][0]
+    assert job["blocked_by"] == [{"id": "J000001", "status": "CANCELLED"}]
+
+
+def test_dependency_on_running_prerequisite_allowed_and_releases(conn):
+    p = submit("a", 1, 5, when=iso(0))
+    batch(10)
+    assert scheduler.get_job(p["id"])["status"] == "RUNNING"
+    # Submitting against a RUNNING prerequisite is fine.
+    dep = submit("b", 1, 5, when=iso(10), depends_on=[p["id"]])
+    assert dep["blocked_by"] == [{"id": "J000001", "status": "RUNNING"}]
+    scheduler.complete_job(p["id"])
+    r = batch(20)
+    assert r["selection_order"] == ["J000002"]
+
+
+def test_unknown_and_cyclic_dependencies_rejected(conn):
+    with pytest.raises(scheduler.SchedulerError, match="unknown depends_on"):
+        scheduler.submit_job("a", 1, 5, depends_on=["J999999"])
+
+    p = submit("a", 1, 5, when=iso(0))
+    d = submit("b", 1, 5, when=iso(0), depends_on=[p["id"]])
+    assert d["depends_on"] == ["J000001"]
+
+    # Job ids are sequential: the next submission is J000003, so depending on
+    # it is a self-dependency cycle. Submission must roll back entirely.
+    with pytest.raises(scheduler.SchedulerError, match="dependency cycle"):
+        scheduler.submit_job("c", 1, 5, depends_on=["J000003"])
+    with pytest.raises(scheduler.NotFound):
+        scheduler.get_job("J000003")
+
+    # Multi-node cycle in the stored graph is also detected defensively:
+    # plant an edge J000001 -> J000002 (closing 1 -> 2 -> 1), then submit a
+    # job that depends on a node participating in that cycle.
+    db.get_conn().execute(
+        "INSERT INTO job_dependencies (job_id, depends_on) VALUES (?, ?)",
+        ("J000001", d["id"]),
+    )
+    with pytest.raises(scheduler.SchedulerError, match="dependency cycle"):
+        scheduler.submit_job("c", 1, 5, depends_on=["J000001"])
+    with pytest.raises(scheduler.NotFound):
+        scheduler.get_job("J000003")
+
+
+def test_blocked_head_blocks_rest_of_tenant_queue(conn):
+    # Strict FIFO: a dependency-blocked head is never skipped to reach a ready
+    # job behind it, and the tenant earns no quantum while it waits.
+    p = submit("other", 8, 5, when=iso(0))                 # saturates cluster
+    submit("a", 1, 5, when=iso(1), depends_on=[p["id"]])  # blocked head
+    submit("a", 1, 5, when=iso(2))                         # ready behind it
+
+    r = batch(10)
+    assert r["selection_order"] == [p["id"]]
+    # Neither of tenant a's jobs ran; a earned no credit via the blocked head.
+    assert balances()["a"] == 0.0
+    detail = [j for j in scheduler.list_jobs(status="QUEUED")
+              if j["tenant_id"] == "a"]
+    assert [j["id"] for j in detail] == ["J000002", "J000003"]
+
+    scheduler.complete_job(p["id"])
+    r2 = batch(20)
+    # Strict FIFO: the formerly blocked head goes first, then the job behind.
+    assert r2["selection_order"] == ["J000002", "J000003"]
+
+
+def test_queue_overview_annotates_blocked_by(conn):
+    p = submit("a", 1, 5, when=iso(0))
+    submit("b", 1, 5, when=iso(1), depends_on=[p["id"]])
+    q = scheduler.queue_overview()
+    groups = {g["tenant_id"]: g for g in q["queues"]}
+    j = groups["b"]["jobs"][0]
+    assert j["depends_on"] == ["J000001"]
+    assert j["blocked_by"] == [{"id": "J000001", "status": "QUEUED"}]
+    # The prerequisite job itself has no blockers.
+    assert groups["a"]["jobs"][0]["blocked_by"] == []

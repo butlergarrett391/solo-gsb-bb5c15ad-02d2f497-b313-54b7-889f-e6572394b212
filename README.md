@@ -79,6 +79,23 @@ QUEUED ──(batch 选中)──▶ RUNNING ──complete──▶ COMPLETED
 
 RUNNING 作业占用 GPU，直到 `complete`/`cancel` 才释放给后续批次。
 
+### 作业依赖（`depends_on`，DAG）
+
+提交作业时可传入前置作业 id 列表；依赖是**集群级**的，允许**跨租户**依赖：
+
+- 前置作业**全部 `COMPLETED`** 后，依赖作业才可被批次调度。
+- 提交时校验：前置作业不存在 → `400 unknown depends_on`；形成环路（含自依赖）
+  → `400 dependency cycle`，作业不会创建。
+- 批次中只有「队首作业的前置已全部完成」的租户参与 DRR；队首被依赖阻塞时
+  **不获得 QUANTUM、也不产生老化信用**（仅推进老化计时点），因此空等依赖
+  无法“刷”出余额；严格 FIFO，被阻塞队首后面的本租户作业同样等待。
+- 前置作业被 **`CANCELLED`** 后永远不可能 COMPLETED：依赖作业**保持 QUEUED**，
+  通过 `GET /jobs/{id}`、`GET /jobs` 与 `GET /queue` 的 `blocked_by` 字段可查询
+  阻塞原因（前置作业 id 及其当前状态）。
+- 作业对象包含：
+  - `depends_on`：全部前置作业 id（去重、按 id 排序）；
+  - `blocked_by`：尚未 COMPLETED 的前置作业 `[{id, status}]`，仅对 QUEUED 作业有意义，空数组表示立即可调度。
+
 ---
 
 ## 配置（环境变量）
@@ -116,8 +133,21 @@ curl -X POST http://localhost:8000/jobs \
 | `gpus` | 是 | 所需 GPU 数（正整数） |
 | `duration_min` | 是 | 预计时长（分钟，正整数） |
 | `weight` | 否 | 租户权重，默认 `1.0`，必须 > 0 |
+| `depends_on` | 否 | 前置作业 id 列表（默认 `[]`），**跨租户允许**；未知 id 或形成环路返回 400，自动去重 |
 
-响应：作业对象（顺序 id 如 `J000001`，`status: QUEUED`）。
+响应：作业对象（顺序 id 如 `J000001`，`status: QUEUED`），含 `depends_on` 与
+`blocked_by` 字段（见上文「作业依赖」一节）。
+
+依赖提交示例（`J000002` 等 `J000001` 完成后才可调度）：
+
+```bash
+curl -X POST http://localhost:8000/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"team-b","gpus":1,"duration_min":30,"depends_on":["J000001"]}'
+# 201 {"id":"J000002","status":"QUEUED",
+#      "depends_on":["J000001"],
+#      "blocked_by":[{"id":"J000001","status":"QUEUED"}], ...}
+```
 
 ### 2. 调度下一批 `POST /scheduler/batch`
 
@@ -172,7 +202,7 @@ curl http://localhost:8000/scheduler/state          # 容量、空闲 GPU、调�
 curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/DISPATCH 审计
 ```
 
-`GET /queue` 示例：
+`GET /queue` 示例（`J000005` 等待 `J000003` 完成，队列中直接标出阻塞原因）：
 
 ```jsonc
 {
@@ -181,7 +211,11 @@ curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/
   "queues": [{
     "tenant_id": "team-c", "weight": 1.0, "balance_gpu_min": 12.5,
     "oldest_queued_at": "2026-09-22T10:00:00+00:00",
-    "jobs": [ { "id": "J000003", "position": 1, "gpus": 4, ... } ]
+    "jobs": [{
+      "id": "J000005", "position": 1, "gpus": 4, "status": "QUEUED",
+      "depends_on": ["J000003"],
+      "blocked_by": [{"id": "J000003", "status": "RUNNING"}], ...
+    }]
   }]
 }
 ```
@@ -190,7 +224,7 @@ curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/jobs` | 提交作业（自动注册/更新租户权重） |
+| POST | `/jobs` | 提交作业（自动注册/更新租户权重，支持 `depends_on` 依赖） |
 | GET | `/jobs` | 列作业（可选 `status`、`tenant_id`） |
 | GET | `/jobs/{id}` | 作业详情 |
 | POST | `/jobs/{id}/cancel` | 取消作业 |
@@ -223,6 +257,14 @@ curl -s -X POST localhost:8000/jobs/J000001/complete  # 释放 2，仍不足 4
 curl -s -X POST localhost:8000/jobs/J000002/complete  # 再释放 6
 curl -s -X POST localhost:8000/scheduler/batch        # => [J000003]，carol 获得等待老化补偿
 curl -s localhost:8000/queue
+
+# 作业依赖（跨租户）：dave 的作业等 carol 的 J000003 完成后才会被调度
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"dave","gpus":2,"duration_min":15,"depends_on":["J000003"]}'
+curl -s -X POST localhost:8000/scheduler/batch        # => []（J000003 仍 RUNNING，dave 不消耗量子）
+curl -s localhost:8000/jobs/J000004                   # blocked_by 标明 J000003/RUNNING
+curl -s -X POST localhost:8000/jobs/J000003/complete
+curl -s -X POST localhost:8000/scheduler/batch        # => [J000004]
 ```
 
 ---
@@ -233,7 +275,7 @@ curl -s localhost:8000/queue
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（12 个：服务层算法 + HTTP 端到端）
+# 运行全部测试（23 个：服务层算法/依赖 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
 # 无需第三方库的核心算法验证脚本（仅用标准库 sqlite3）
@@ -248,7 +290,7 @@ CLUSTER_GPUS=8 .venv/bin/python -m uvicorn app.main:app --reload --port 8000
 ```
 app/
   config.py       # 环境变量配置
-  db.py           # SQLite 连接、schema（tenants/jobs/batches/ledger）
+  db.py           # SQLite 连接、schema（tenants/jobs/batches/ledger/job_dependencies）
   scheduler.py    # 公平排队核心（WDRR + 老化，框架无关）
   main.py         # FastAPI 路由与请求模型
 scripts/

@@ -36,6 +36,20 @@ Reproducibility
 Tenant visit order is tenant-id ascending, jobs are FIFO per tenant, job ids
 are sequential, and ``run_batch`` accepts an injectable ``now``/seed-free
 logic: identical inputs always produce identical selection order.
+
+Job dependencies
+================
+``POST /jobs`` accepts ``depends_on``: a list of job ids (from ANY tenant)
+that must be COMPLETED before the new job becomes schedulable. Unknown ids
+and dependency cycles (including self-dependence) are rejected at submit.
+Submission therefore never closes a cycle, but the whole graph is rechecked
+defensively. During a batch, a tenant is visited only when its head-of-line
+job's prerequisites are all COMPLETED; a dependency-blocked head receives
+neither quantum nor aging credit (its aging checkpoint is merely advanced),
+so blocked dependencies can never be farmed into spendable balance. A
+CANCELLED prerequisite can never complete: dependents stay QUEUED forever
+and ``blocked_by`` (on the job object and in ``GET /queue``) reports the
+prerequisite id together with its current status.
 """
 from __future__ import annotations
 
@@ -117,6 +131,93 @@ def _has_queued(conn: sqlite3.Connection, tenant_id: str) -> bool:
         (tenant_id, QUEUED),
     ).fetchone()
     return row["n"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Job dependencies (DAG)
+# ---------------------------------------------------------------------------
+
+def _depends_on(conn: sqlite3.Connection, job_id: str) -> list[str]:
+    """Prerequisite job ids in submission order (id ascending)."""
+    rows = conn.execute(
+        """SELECT depends_on FROM job_dependencies
+            WHERE job_id = ? ORDER BY depends_on""",
+        (job_id,),
+    ).fetchall()
+    return [r["depends_on"] for r in rows]
+
+
+def _unmet_prerequisites(
+    conn: sqlite3.Connection, job_id: str
+) -> list[dict[str, str]]:
+    """Prerequisites that have not COMPLETED, with the reason (their status).
+
+    QUEUED/RUNNING prerequisites may still release the job; a CANCELLED one
+    can never complete, so the dependent stays queued forever and the entry
+    here explains why.
+    """
+    rows = conn.execute(
+        """SELECT j.id AS id, j.status AS status
+             FROM job_dependencies d
+             JOIN jobs j ON j.id = d.depends_on
+            WHERE d.job_id = ? AND j.status != ?
+            ORDER BY j.id""",
+        (job_id, COMPLETED),
+    ).fetchall()
+    return [{"id": r["id"], "status": r["status"]} for r in rows]
+
+
+def _find_cycle(
+    conn: sqlite3.Connection, extra_edges: dict[str, list[str]] | None = None
+) -> list[str] | None:
+    """Return a job-id cycle in the dependency graph, or None when it is a DAG.
+
+    ``extra_edges`` maps a (possibly not-yet-inserted) job id to its
+    prerequisites, so a candidate submission can be validated against the
+    graph it would create. Iterative DFS with WHITE/GRAY/BLACK coloring.
+    """
+    extra_edges = extra_edges or {}
+    graph: dict[str, list[str]] = {}
+    rows = conn.execute(
+        "SELECT job_id, depends_on FROM job_dependencies"
+    ).fetchall()
+    for r in rows:
+        graph.setdefault(r["job_id"], []).append(r["depends_on"])
+        graph.setdefault(r["depends_on"], [])
+    for node, prereqs in extra_edges.items():
+        graph.setdefault(node, []).extend(prereqs)
+        for p in prereqs:
+            graph.setdefault(p, [])
+
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: dict[str, int] = {node: WHITE for node in graph}
+    for start in sorted(graph):
+        if color.get(start, BLACK) != WHITE:
+            continue
+        # Stack of (node, next-neighbour-index); parallel pos[] stack records
+        # the path so the GRAY edge closing a cycle names the exact nodes.
+        stack: list[str] = [start]
+        pos: list[int] = [0]
+        color[start] = GRAY
+        while stack:
+            node = stack[-1]
+            neighbours = graph[node]
+            i = pos[-1]
+            if i < len(neighbours):
+                nxt = neighbours[i]
+                pos[-1] = i + 1
+                if color.get(nxt, WHITE) == GRAY:
+                    cycle = stack[stack.index(nxt):] + [nxt]
+                    return cycle
+                if color.get(nxt, WHITE) == WHITE:
+                    color[nxt] = GRAY
+                    stack.append(nxt)
+                    pos.append(0)
+            else:
+                color[node] = BLACK
+                stack.pop()
+                pos.pop()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +309,7 @@ def submit_job(
     gpus: int,
     duration_min: int,
     weight: float = 1.0,
+    depends_on: list[str] | None = None,
 ) -> dict[str, Any]:
     if not tenant_id or not tenant_id.strip():
         raise SchedulerError("tenant_id must be a non-empty string")
@@ -217,6 +319,15 @@ def submit_job(
         raise SchedulerError("duration_min must be a positive integer")
     if weight <= 0:
         raise SchedulerError("weight must be > 0")
+    if depends_on is None:
+        depends_on = []
+    if not isinstance(depends_on, list) or any(
+        not isinstance(d, str) or not d.strip() for d in depends_on
+    ):
+        raise SchedulerError(
+            "depends_on must be a list of non-empty job id strings"
+        )
+    depends_on = sorted(set(depends_on))
 
     settings = get_settings()
     if gpus > settings.cluster_gpus:
@@ -249,6 +360,34 @@ def submit_job(
             )
 
         job_id = _job_id(conn)
+
+        # Reject unknown prerequisites. Prerequisites may belong to other
+        # tenants: dependencies are cluster-global, not tenant-scoped.
+        if depends_on:
+            placeholders = ",".join("?" for _ in depends_on)
+            found = {
+                r["id"] for r in conn.execute(
+                    f"SELECT id FROM jobs WHERE id IN ({placeholders})",
+                    depends_on,
+                ).fetchall()
+            }
+            missing = [
+                d for d in depends_on
+                if d not in found and d != job_id
+            ]
+            if missing:
+                raise SchedulerError(
+                    f"unknown depends_on job id(s): {', '.join(missing)}"
+                )
+
+        # Reject anything that would close a cycle (including self
+        # dependencies such as depends_on == the new job's own id).
+        cycle = _find_cycle(conn, {job_id: depends_on})
+        if cycle is not None:
+            raise SchedulerError(
+                "dependency cycle detected: " + " -> ".join(cycle)
+            )
+
         conn.execute(
             """INSERT INTO jobs
                    (id, tenant_id, gpus, duration_min, cost_gpu_min, status,
@@ -256,6 +395,11 @@ def submit_job(
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (job_id, tenant_id, gpus, duration_min, cost, QUEUED, now),
         )
+        for prereq in depends_on:
+            conn.execute(
+                "INSERT INTO job_dependencies (job_id, depends_on) VALUES (?, ?)",
+                (job_id, prereq),
+            )
         # aging_settled_at is left untouched: a non-empty queue keeps accruing
         # wait time, and a drained queue already has it reset to NULL.
         return _get_job_or_404(conn, job_id)
@@ -265,10 +409,10 @@ def _get_job_or_404(conn: sqlite3.Connection, job_id: str) -> dict[str, Any]:
     row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if row is None:
         raise NotFound(f"job '{job_id}' not found")
-    return _job_dict(row)
+    return _job_dict(conn, row)
 
 
-def _job_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _job_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
         "tenant_id": row["tenant_id"],
@@ -276,6 +420,14 @@ def _job_dict(row: sqlite3.Row) -> dict[str, Any]:
         "duration_min": row["duration_min"],
         "cost_gpu_min": round(row["cost_gpu_min"], 6),
         "status": row["status"],
+        "depends_on": _depends_on(conn, row["id"]),
+        # Present for QUEUED jobs: prerequisites that are not COMPLETED yet,
+        # each annotated with its current status (QUEUED/RUNNING/CANCELLED).
+        # Empty means every prerequisite is done and the job is schedulable.
+        "blocked_by": (
+            _unmet_prerequisites(conn, row["id"])
+            if row["status"] == QUEUED else []
+        ),
         "queued_at": row["queued_at"],
         "scheduled_at": row["scheduled_at"],
         "completed_at": row["completed_at"],
@@ -385,6 +537,30 @@ def run_batch(
             conn.commit()
             return _batch_result(conn, batch_id, settings)
 
+        # Dependency readiness is recomputed from the *current* head of each
+        # queue: only a COMPLETED prerequisite releases a job, and a tenant's
+        # next head (revealed after a dispatch) may itself be blocked. A
+        # tenant whose head-of-line job is blocked neither accrues aging nor
+        # spends quantum: waiting on another job is not scheduler starvation,
+        # and blocked batches must not hand out spendable credit.
+        def head_of(tenant_id: str):
+            return conn.execute(
+                """SELECT * FROM jobs
+                    WHERE tenant_id = ? AND status = ?
+                    ORDER BY queued_at, id LIMIT 1""",
+                (tenant_id, QUEUED),
+            ).fetchone()
+
+        def head_ready(head) -> bool:
+            return head is not None and not _unmet_prerequisites(
+                conn, head["id"]
+            )
+
+        active_ids = [t["tenant_id"] for t in active]
+        ready_at_start = {
+            tid for tid in active_ids if head_ready(head_of(tid))
+        }
+
         # Aging is settled even when the cluster is full, so waiting tenants
         # keep accumulating starvation compensation across blocked batches.
         # --- Aging settlement at batch start -------------------------------
@@ -392,7 +568,17 @@ def run_batch(
         # arrival: on first observation we settle from queued_at, afterwards
         # from the previous settlement instant. Same-instant retries grant
         # nothing, so the endpoint cannot be farmed via aging either.
+        # Dependency-blocked tenants receive nothing, but their checkpoint is
+        # advanced: once dependencies release them, waiting is measured from
+        # the release point rather than the original submission.
         for t in active:
+            if t["tenant_id"] not in ready_at_start:
+                conn.execute(
+                    "UPDATE tenants SET aging_settled_at = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (now_str, now_str, t["tenant_id"]),
+                )
+                continue
             oldest = conn.execute(
                 "SELECT MIN(queued_at) AS ts FROM jobs "
                 "WHERE tenant_id = ? AND status = ?",
@@ -444,18 +630,9 @@ def run_batch(
         run_index = 0
         rounds = 0
         free = available
-        active_ids = [t["tenant_id"] for t in active]
         commit_mark = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM ledger"
         ).fetchone()["m"]
-
-        def head_of(tenant_id: str):
-            return conn.execute(
-                """SELECT * FROM jobs
-                    WHERE tenant_id = ? AND status = ?
-                    ORDER BY queued_at, id LIMIT 1""",
-                (tenant_id, QUEUED),
-            ).fetchone()
 
         def rollback_uncommitted() -> None:
             rows = conn.execute(
@@ -470,12 +647,13 @@ def run_batch(
             conn.execute("DELETE FROM ledger WHERE id > ?", (commit_mark,))
 
         while rounds < settings.max_rounds:
-            fitting = [
-                tid for tid in active_ids
-                if (h := head_of(tid)) is not None and h["gpus"] <= free
-            ]
+            fitting = []
+            for tid in active_ids:
+                h = head_of(tid)
+                if h is not None and head_ready(h) and h["gpus"] <= free:
+                    fitting.append(tid)
             if not fitting:
-                break  # every queued job is capacity-blocked; no grants
+                break  # every queued job is capacity/dependency-blocked
 
             rounds += 1
             dispatched_this_round = False
@@ -588,7 +766,7 @@ def _batch_result(
         "rounds": batch["rounds"],
         "jobs_selected": len(jobs),
         "selection_order": [j["id"] for j in jobs],
-        "selected_jobs": [_job_dict(j) | {"run_index": j["run_index"]}
+        "selected_jobs": [_job_dict(conn, j) | {"run_index": j["run_index"]}
                           for j in jobs],
         "tenants": _list_tenants(conn),
         "events": _list_ledger(conn, batch_id=batch_id),
@@ -616,7 +794,8 @@ def list_jobs(
         params.append(tenant_id)
     sql += " ORDER BY queued_at, id"
     with db.get_lock():
-        return [_job_dict(r) for r in db.get_conn().execute(sql, params)]
+        conn = db.get_conn()
+        return [_job_dict(conn, r) for r in conn.execute(sql, params)]
 
 
 def queue_overview() -> dict[str, Any]:
@@ -647,7 +826,7 @@ def queue_overview() -> dict[str, Any]:
                 "balance_gpu_min": round(t["deficit"], 6),
                 "oldest_queued_at": queued[0]["queued_at"],
                 "jobs": [
-                    _job_dict(j) | {"position": pos}
+                    _job_dict(conn, j) | {"position": pos}
                     for pos, j in enumerate(queued, start=1)
                 ],
             })
